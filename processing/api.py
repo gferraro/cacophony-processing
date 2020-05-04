@@ -111,3 +111,9 @@ class API:
         if r.status_code == 200:
             return r.json()["trackTagId"]
         raise IOError(r.text)
+
+    def get_tracks(self, recording):
+        url = self.url + "/{}/tracks".format(recording["id"])
+        r = requests.get(url)
+        r.raise_for_status()
+        return r.json()["tracks"]

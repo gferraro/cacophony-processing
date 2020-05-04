@@ -28,8 +28,6 @@ from . import API
 from . import S3
 from . import logs
 from .processutils import HandleCalledProcessError
-from .tagger import calculate_tags
-
 
 DOWNLOAD_FILENAME = "recording.cptv"
 SLEEP_SECS = 10
@@ -46,13 +44,11 @@ def process(recording, conf):
 
     api = API(conf.api_url)
     s3 = S3(conf)
-
     with tempfile.TemporaryDirectory() as temp_dir:
         filename = Path(temp_dir) / DOWNLOAD_FILENAME
         recording["filename"] = filename
         logger.debug("downloading recording")
         s3.download(recording["rawFileKey"], str(filename))
-
         update_metadata(conf, recording, api)
         logger.debug("metadata updated")
 
@@ -74,18 +70,18 @@ def classify_models(api, command, conf):
 def classify_file(api, command, conf, model):
 
     command = "{} -m {} -p {}".format(command, model.model_file, model.preview)
-
     classify_info = run_classify_command(command, conf.classify_dir)
 
     track_info = classify_info["tracks"]
     formatted_tracks = format_track_data(track_info)
 
     # Auto tag the video
-    tagged_tracks, tags = calculate_tags(formatted_tracks, conf)
+    tagged_tracks = [track for track in formatted_tracks if "confident_tag" in track]
+    tags = set([track["confident_tag"] for track in formatted_tracks])
 
     model_result = {
         "tracks": tagged_tracks,
-        "tags": tags,
+        "multiple": classify_info.get("multiple", None),
         "algiorithm_id": api.get_algorithm_id(classify_info["algorithm"]),
     }
 
@@ -126,11 +122,12 @@ def classify(conf, recording, api, s3, logger):
     model_results = classify_models(api, command, conf)
     main_model = model_results[0]
 
-    for label, tag in main_model["tags"].items():
-        logger.debug("tag: %s (%.2f)", label, tag["confidence"])
-        if tag == MULTIPLE:
-            api.tag_recording(recording, label, tag)
-
+    if main_model.get("multiple"):
+        api.tag_recording(
+            recording,
+            MULTIPLE,
+            {"event": MULTIPLE, "confidence": main_model["multiple"]},
+        )
     upload_tracks(api, recording, main_model, model_results, logger)
 
     # Upload mp4
@@ -177,9 +174,23 @@ def update_metadata(conf, recording, api):
 
 
 def upload_tracks(api, recording, main_model, model_results, logger):
+    if not main_model["tracks"]:
+        return
+    existing_tracks = api.get_tracks(recording)
     other_models = [model for model in model_results if model != main_model]
     for track in main_model["tracks"]:
-        track["id"] = api.add_track(recording, track, main_model["algiorithm_id"])
+        if existing_tracks:
+            track_to_save = find_matching_track(existing_tracks, track, subkey="data")
+            if track_to_save is None:
+                logger.warn(
+                    "Could not find a matching existing track %s for recording %s track %s",
+                    recording["id"],
+                    track["id"],
+                )
+                continue
+            track["id"] = track_to_save["id"]
+        else:
+            track["id"] = api.add_track(recording, track, main_model["algiorithm_id"])
         add_track_tags(api, recording, track, main_model, logger)
 
         # add track tags for all other models
@@ -205,13 +216,16 @@ def add_track_tags(api, recording, track, model, logger):
         api.add_track_tag(recording, track, data=track_data)
 
 
-def find_matching_track(tracks, track):
+def find_matching_track(tracks, track, subkey=None):
     """ Find the same track in a different models tracks data
     This is a track which starts at the same time, and has the same starting position """
 
     for other_track in tracks:
+        start_meta = other_track
+        if subkey:
+            start_meta = other_track[subkey]
         if (
-            other_track["start_s"] == track["start_s"]
-            and other_track["positions"][0] == track["positions"][0]
+            start_meta["start_s"] == track["start_s"]
+            and start_meta["positions"][0] == track["positions"][0]
         ):
             return other_track
